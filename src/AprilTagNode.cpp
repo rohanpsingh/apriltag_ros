@@ -2,6 +2,7 @@
 #include "pose_estimation.hpp"
 #include <apriltag_msgs/msg/april_tag_detection.hpp>
 #include <apriltag_msgs/msg/april_tag_detection_array.hpp>
+#include <sstream>
 #ifdef cv_bridge_HPP
 #include <cv_bridge/cv_bridge.hpp>
 #else
@@ -80,11 +81,14 @@ private:
 
     const image_transport::CameraSubscriber sub_cam;
     const rclcpp::Publisher<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr pub_detections;
+    const image_transport::Publisher pub_detections_image;
     tf2_ros::TransformBroadcaster tf_broadcaster;
 
     pose_estimation_f estimate_pose = nullptr;
 
     void onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img, const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci);
+
+    void drawDetections(cv_bridge::CvImagePtr image, zarray_t* detections);
 
     rcl_interfaces::msg::SetParametersResult onParameter(const std::vector<rclcpp::Parameter>& parameters);
 };
@@ -105,6 +109,7 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
         declare_parameter("image_transport", "raw", descr({}, true)),
         rmw_qos_profile_sensor_data)),
     pub_detections(create_publisher<apriltag_msgs::msg::AprilTagDetectionArray>("detections", rclcpp::QoS(1))),
+    pub_detections_image(image_transport::create_publisher(this, "detections_image")),
     tf_broadcaster(this)
 {
     // read-only parameters
@@ -250,6 +255,11 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
     if(estimate_pose != nullptr)
         tf_broadcaster.sendTransform(tfs);
 
+    // Create detection visualization image
+    cv_bridge::CvImagePtr detection_image = cv_bridge::toCvCopy(msg_img, "bgr8");
+    drawDetections(detection_image, detections);
+    pub_detections_image.publish(detection_image->toImageMsg());
+
     apriltag_detections_destroy(detections);
 }
 
@@ -278,4 +288,49 @@ AprilTagNode::onParameter(const std::vector<rclcpp::Parameter>& parameters)
     result.successful = true;
 
     return result;
+}
+
+void AprilTagNode::drawDetections(cv_bridge::CvImagePtr image, zarray_t* detections)
+{
+    for (int i = 0; i < zarray_size(detections); i++)
+    {
+        apriltag_detection_t *det;
+        zarray_get(detections, i, &det);
+
+        // Check if this detection should be processed (same logic as in onCamera)
+        if(!tag_frames.empty() && !tag_frames.count(det->id)) { continue; }
+        if(det->hamming > max_hamming) { continue; }
+
+        // Draw tag outline with edge colors green, blue, blue, red
+        // (going counter-clockwise, starting from lower-left corner in
+        // tag coords). cv::Scalar(Blue, Green, Red) format for the edge
+        // colors!
+	const int thickness = 3;
+        cv::line(image->image, cv::Point((int)det->p[0][0], (int)det->p[0][1]),
+             cv::Point((int)det->p[1][0], (int)det->p[1][1]),
+	     cv::Scalar(0, 0xff, 0), thickness); // green
+        cv::line(image->image, cv::Point((int)det->p[0][0], (int)det->p[0][1]),
+             cv::Point((int)det->p[3][0], (int)det->p[3][1]),
+	     cv::Scalar(0, 0, 0xff), thickness); // red
+        cv::line(image->image, cv::Point((int)det->p[1][0], (int)det->p[1][1]),
+             cv::Point((int)det->p[2][0], (int)det->p[2][1]),
+	     cv::Scalar(0xff, 0, 0), thickness); // blue
+        cv::line(image->image, cv::Point((int)det->p[2][0], (int)det->p[2][1]),
+             cv::Point((int)det->p[3][0], (int)det->p[3][1]),
+	     cv::Scalar(0xff, 0, 0), thickness); // blue
+
+        // Print tag ID in the middle of the tag
+        std::stringstream ss;
+        ss << det->id;
+        cv::String text = ss.str();
+        int fontface = cv::FONT_HERSHEY_SCRIPT_SIMPLEX;
+        double fontscale = 1.0;
+        int baseline;
+        cv::Size textsize = cv::getTextSize(text, fontface,
+                                            fontscale, 2, &baseline);
+        cv::putText(image->image, text,
+                    cv::Point((int)(det->c[0]-textsize.width/2),
+                              (int)(det->c[1]+textsize.height/2)),
+                    fontface, fontscale, cv::Scalar(0xff, 0x99, 0), 2);
+    }
 }
